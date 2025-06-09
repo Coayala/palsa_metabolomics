@@ -1,0 +1,351 @@
+---
+title: "KEGG pathways"
+author: "Christian Ayala Ortiz"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# 1. Setup
+
+## Importing libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(ggkegg)
+library(ggh4x)
+library(tidyverse)
+```
+
+# 2. Loading data
+
+```{r}
+metadata <- read_csv('data/metadata_palsa_labeled.csv') %>% 
+  mutate(sample_type = str_replace(sample_type, 'Sample', 'Unlabeled'),
+         type = factor(type, levels = c('LO', 'PL', 'PO')),
+         time = factor(time, levels = c('T0', 'T1', 'T2', 'T3')))
+
+lcms_annotation <- read_csv('output_tables/lcms_annotation_final.csv') %>% 
+  mutate(class_fill = case_when(is.na(class) & !is.na(superclass) ~ 
+                                  paste0('Other class of ', superclass),
+                                is.na(class) & is.na(superclass) ~ 'No annotation',
+                                TRUE ~ class),
+         class_lump = fct_lump(class_fill, n = 10))
+
+nmr <- read_csv('data/NMR_palsa_all.csv')
+
+lcms_abundance_table <- read_csv('output_tables/lcms_abundance_table.csv') %>% 
+  column_to_rownames(var = 'FeatureID')
+
+nmr_abundance_table <- read_csv('data/NMR_palsa_all.csv') %>% 
+  column_to_rownames(var = 'Compound') %>% 
+  dplyr::select(all_of(metadata$SampleID))
+
+lcms_annotation <- read_csv('output_tables/lcms_annotation_final.csv') %>% 
+  mutate(class_fill = case_when(is.na(class) & !is.na(superclass) ~ 
+                                  paste0('Other class of ', superclass),
+                                is.na(class) & is.na(superclass) ~ 'No annotation',
+                                TRUE ~ class),
+         class_lump = fct_lump(class_fill, n = 10))
+
+label_status <- read_csv('output_tables/label_status.csv')
+
+label_nmr <- read_csv('data/NMR_palsa_labeled_ready.csv') %>% 
+  pivot_longer(!c(Compound, KEGG_ID, Formula, Weight), 
+               names_to = 'SampleID', values_to = 'value') %>% 
+  mutate(label = ifelse(value > 0, 'Labeled', 'Non-labeled'))
+```
+
+# 3. Pathways
+
+```{r}
+lc_ids <- lcms_annotation %>% 
+  select(KEGG_ID) %>% 
+  drop_na() %>% 
+  mutate(KEGG_ID = paste0('cpd:', KEGG_ID)) %>% 
+  pull()
+
+nmr_ids <- nmr %>% 
+  select(KEGG_ID) %>% 
+  drop_na() %>% 
+  mutate(KEGG_ID = paste0('cpd:', KEGG_ID)) %>% 
+  pull()
+```
+
+
+```{r}
+deg_flav <- pathway('ko00946')
+flav <- pathway('ko00944')
+flavoid <- pathway('ko00941')
+tca <- pathway('ko00020')
+pyr <- pathway('ko00620')
+carbon <- pathway('ko01200')
+glyco <- pathway('ko00010')
+oxo <- pathway('ko01210')
+# phenyl <- pathway('ko01061')
+
+pos <- flav %>% 
+  activate(nodes) %>% 
+  data.frame() %>% 
+  summarise(min = min(y))
+
+flav_mut <- flav %>% 
+  activate(nodes) %>% 
+  mutate(x = x/max(x))
+
+flavoid_mut <- flavoid %>%
+  activate(nodes) %>%
+  mutate(y = y + pos$min,
+         x = x/max(x))
+
+deg_flav_mut <- deg_flav %>% 
+  activate(nodes) %>% 
+  mutate(y = y+ 2*pos$min, 
+         x = x/max(x))
+
+tca_mut <- tca %>% 
+  activate(nodes) %>% 
+  mutate(y = y + 3*pos$min, 
+         x = x/max(x))
+
+
+glyco_mut <- glyco %>% 
+  activate(nodes) %>% 
+  mutate(y = y + 4*pos$min, 
+         x = x/max(x, na.rm = TRUE))
+
+oxo_mut <- oxo %>% 
+  activate(nodes) %>% 
+  mutate(y = y + 5*pos$min, 
+         x = x/max(x, na.rm = TRUE))
+
+
+joined <- graph_join(flav_mut, deg_flav_mut) %>% 
+  graph_join(glyco_mut) %>% 
+  graph_join(tca_mut) %>% 
+  graph_join(oxo_mut) %>% 
+  graph_join(flavoid_mut)
+
+new_path <- joined %>% 
+  convert(to_contracted, name) %>% 
+  activate(nodes) %>% 
+  mutate(purrr::map_vec(.orig_data, function(x) x[1,])) %>% 
+  activate(edges) %>% 
+  mutate(reaction=purrr::map_vec(.orig_data, 
+                                 function(x) paste0(unique(x$reaction),
+                                                    collapse=",")),
+         subtype_name=purrr::map_vec(.orig_data, 
+                                     function(x) unique(x$subtype_name)))
+
+new_path_graph <- new_path %>% 
+  activate(nodes) %>% 
+  mutate(compound = convert_id('compound'),
+         path_id = case_when(pathway_id == 'ko00944' ~ 'Flavone and\nflavonol biosynthesis',
+                             pathway_id == 'ko00946' ~ 'Degradation of\nflavonoids',
+                             pathway_id == 'ko00020' ~ 'TCA cycle',
+                             pathway_id == 'ko00620' ~ 'Pyruvate metabolism',
+                             pathway_id == 'ko01200' ~ 'Carbon metabolism',
+                             pathway_id == 'ko00010' ~ 'Glycolysis',
+                             pathway_id == 'ko01210' ~ '2-oxocarboxylic acid metabolism',
+                             pathway_id == 'ko00941' ~ 'Flavonoid biosynthesis',
+                             pathway_id == 'ko01061' ~ 'Biosynthesis of phenylpropanoids'),
+         path_id = factor(path_id, levels = c('Flavone and\nflavonol biosynthesis',
+                                              'Flavonoid biosynthesis',
+                                              'Degradation of\nflavonoids',
+                                              'TCA cycle',
+                                              'Glycolysis',
+                                              '2-oxocarboxylic acid metabolism',
+                                              'Biosynthesis of phenylpropanoids'))) %>% 
+  ggraph(layout = 'manual', x = x , y = y) +
+  geom_edge_link(width=0.1, color = 'gray70')+
+  geom_node_point(aes(color = path_id)) +
+  ggfx::with_outer_glow(
+    geom_node_point(size = 3,
+                    aes(filter=name%in%lc_ids),
+                    color = 'steelblue'),
+    colour = 'blue',
+    expand = 3
+  ) +
+  ggfx::with_outer_glow(
+    geom_node_point(size = 3,
+                    aes(filter=name%in%nmr_ids),
+                    color = 'indianred'),
+    colour = 'indianred2',
+    expand = 3
+  ) +
+  scale_color_manual(values = ggpubr::get_palette('Set2', 6)) +
+  # geom_node_point(color="blue", aes(filter=occ>1)) + 
+  # geom_node_point(color="red", aes(filter=name=="cpd:C00024"))+
+  # graphhighlight::highlight_node(filter=name=="cpd:C00024", glow=TRUE,
+  #                                highlight_color = "red")+
+  geom_node_text(size=2, family="serif", repel=FALSE,
+                 aes(label=compound, filter=type=="compound", y = y -10))+
+  geom_node_label(aes(label=compound, filter=name%in%c(lc_ids, nmr_ids)),
+                  repel = TRUE,
+                  size = 3) +
+  labs(color = 'Pathway') +
+  theme_void()
+
+new_path_graph
+
+# ggsave('output_figures/kegg_pathways.png', dpi = 300, width = 10, height = 8, bg = 'white')
+```
+
+# 4. Changes in abundance specific metabolites
+
+## 4.1 Calculate log2 values
+
+```{r}
+lc_log2 <- lcms_abundance_table %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  pivot_longer(!FeatureID, names_to = 'SampleID', values_to = 'abundance') %>% 
+  inner_join(metadata, by = 'SampleID') %>%
+  filter(type == 'LO' | type == 'PL') %>% 
+  group_by(FeatureID) %>% 
+  filter(sum(abundance) != 0) %>% 
+  group_by(FeatureID, time, type) %>% 
+  summarise(mean_ab = mean(abundance)) %>% 
+  group_by(FeatureID) %>% 
+  nest() %>% 
+  mutate(log2_changes = purrr::map(data, function(df){
+    
+    df$mean_ab[df$mean_ab == 0] <- min(df$mean_ab[df$mean_ab != 0])/10
+    
+    df_lo <- df %>% 
+      filter(type == 'LO')
+    
+    df_pl <- df %>% 
+      filter(type == 'PL')
+    
+    values_lo <- set_names(df_lo$mean_ab,
+                           nm = df_lo$time)
+    
+    values_pl <- set_names(df_pl$mean_ab,
+                           nm = df_pl$time)
+    
+    new_df <- tribble(
+      ~time, ~type, ~LFC,
+      'T0', 'LO', log2(values_lo['T0'] / values_lo['T0']),
+      'T1', 'PL', log2(values_pl['T1'] / values_lo['T0']),
+      'T2', 'PL', log2(values_pl['T2'] / values_lo['T0']),
+      'T3', 'PL', log2(values_pl['T3'] / values_lo['T0']),
+    )
+    
+    return(new_df)
+  })) %>% 
+  dplyr::select(-data) %>% 
+  unnest(cols = c(log2_changes)) %>% 
+  mutate(dataset = 'LC-MS/MS')
+
+nmr_log2 <- nmr_abundance_table %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  pivot_longer(!FeatureID, names_to = 'SampleID', values_to = 'abundance') %>% 
+  inner_join(metadata, by = 'SampleID') %>%
+  filter(type == 'LO' | type == 'PL') %>% 
+  group_by(FeatureID) %>% 
+  filter(sum(abundance) != 0) %>% 
+  group_by(FeatureID, time, type) %>% 
+  summarise(mean_ab = mean(abundance)) %>% 
+  group_by(FeatureID) %>% 
+  nest() %>% 
+  mutate(log2_changes = purrr::map(data, function(df){
+    
+    df$mean_ab[df$mean_ab == 0] <- min(df$mean_ab[df$mean_ab != 0])/10
+    
+    df_lo <- df %>% 
+      filter(type == 'LO')
+    
+    df_pl <- df %>% 
+      filter(type == 'PL')
+    
+    values_lo <- set_names(df_lo$mean_ab,
+                           nm = df_lo$time)
+    
+    values_pl <- set_names(df_pl$mean_ab,
+                           nm = df_pl$time)
+    
+    new_df <- tribble(
+      ~time, ~type, ~LFC,
+      'T0', 'LO', log2(values_lo['T0'] / values_lo['T0']),
+      'T1', 'PL', log2(values_pl['T1'] / values_lo['T0']),
+      'T2', 'PL', log2(values_pl['T2'] / values_lo['T0']),
+      'T3', 'PL', log2(values_pl['T3'] / values_lo['T0']),
+    )
+    
+    return(new_df)
+  })) %>% 
+  dplyr::select(-data) %>% 
+  unnest(cols = c(log2_changes)) %>% 
+  mutate(dataset = 'NMR')
+
+```
+
+## 4.2 Get labeled metabolites
+
+```{r}
+label_lc_features <- label_status %>% 
+  filter(label_irreg == 'Labeled') %>% 
+  inner_join(metadata) %>% 
+  select(FeatureID, time, type, label = label_irreg) %>% 
+  distinct() %>% 
+  mutate(dataset = 'LC-MS/MS')
+
+label_nmr_features <- label_nmr %>% 
+  filter(label == 'Labeled') %>% 
+  inner_join(metadata) %>% 
+  select(FeatureID = Compound, time, type, label) %>% 
+  distinct() %>% 
+  mutate(dataset = 'NMR')
+
+all_labeled_features <- rbind(label_lc_features, label_nmr_features)
+```
+
+
+## 4.1 Plot
+
+```{r}
+lc_log2_plot <- rbind(lc_log2, nmr_log2) %>% 
+  left_join(all_labeled_features) %>% 
+  filter(FeatureID %in% c('MW_610.15435@RT_22.514',
+                          'MW_290.07908@RT_17.449',
+                          'MW_578.14291@RT_13.812',
+                          'MW_464.09571@RT_23.624',
+                          'Glucose',
+                          'Fructose',
+                          'Sucrose',
+                          'Mannitol',
+                          'Gallate',
+                          'Protocatechuate',
+                          'Acetate',
+                          'Pyruvate')) %>%
+  left_join(lcms_annotation) %>%
+  mutate(label = if_else(is.na(label), 'Unlabeled', label),
+         Name = str_remove(final_name, '_peak.*'),
+         Name = if_else(is.na(Name), FeatureID, Name)) %>% 
+  ggplot(aes(x = time,
+             y = LFC)) +
+  geom_hline(yintercept = 0,
+             linetype = 2) +
+  geom_line(aes(group = FeatureID)) +
+  geom_point(aes(fill = label),
+             shape = 21,
+             size = 3) + 
+  scale_fill_manual(values = c('indianred2', 'gray80')) +
+  labs(fill = 'Label status') +
+  facet_wrap2(~dataset + Name,
+              strip = strip_nested(
+                background_x = list(element_blank(),
+                                    element_blank(),
+                                    element_blank(),
+                                    NULL, NULL, NULL, NULL,
+                                    NULL, NULL, NULL, NULL,
+                                    NULL, NULL, NULL, NULL)
+              )) +
+  theme_bw() +
+  theme(axis.title.x = element_blank())
+
+lc_log2_plot
+ggsave('output_figures/Supp3.png', lc_log2_plot, 
+       dpi = 300, width = 8, height = 6)
+```
+
+
+
+

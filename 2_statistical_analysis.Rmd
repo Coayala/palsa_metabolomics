@@ -1,0 +1,1079 @@
+---
+title: "2_statistical_analysis"
+author: "Christian Ayala"
+date: "`r Sys.Date()`"
+output: html_document
+---
+# 1. Setup
+
+## Importing libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(ggpubr)
+library(patchwork)
+library(vegan)
+library(ggtext)
+library(ggforce)
+library(mixOmics)
+library(ape)
+library(ggh4x)
+library(glue)
+library(classyfireR)
+library(ComplexHeatmap)
+library(tidyverse)
+source('functions_cdis_norm_stats.R')
+source('functions_cdis_diff.R')
+```
+
+# 2. Loading data
+
+```{r}
+metadata <- read_csv('data/metadata_palsa_labeled.csv') %>% 
+  mutate(sample_type = str_replace(sample_type, 'Sample', 'Unlabeled'),
+         type = factor(type, levels = c('LO', 'PL', 'PO')),
+         time = factor(time, levels = c('T0', 'T1', 'T2', 'T3')))
+
+lcms_abundance_table <- read_csv('output_tables/lcms_abundance_table.csv') %>% 
+  column_to_rownames(var = 'FeatureID')
+
+nmr_abundance_table <- read_csv('data/NMR_palsa_all.csv') %>% 
+  column_to_rownames(var = 'Compound') %>% 
+  dplyr::select(all_of(metadata$SampleID))
+
+nmr_abundance_table %>% rownames_to_column(var = 'FeatureID') %>% 
+  write_csv('output_tables/Supplementary Table 5.csv')
+
+lcms_annotation <- read_csv('output_tables/lcms_annotation_final.csv') %>% 
+  mutate(classification_ready = case_when(
+    is.na(kingdom) ~ 'No annotation',
+    is.na(`level 5`) & is.na(subclass) & is.na(class) & is.na(superclass) ~ 
+      paste0('Other superclass of ', kingdom),
+    is.na(`level 5`) & is.na(subclass) & is.na(class) ~ 
+      paste0('Other class of ', superclass),
+    is.na(`level 5`) & is.na(subclass) ~ 
+      paste0('Other subclass of ', class),
+    is.na(`level 5`)  ~ 
+      paste0('Other ', subclass),
+    TRUE ~ `level 5`
+  ),
+  class_fill = case_when(is.na(class) & !is.na(superclass) ~ 
+                           paste0('Other class of ', superclass),
+                         is.na(class) & is.na(superclass) ~ 'No annotation',
+                         TRUE ~ class),
+  class_lump = fct_lump(class_fill, n = 10)) %>% 
+  group_by(class_lump) %>% 
+  mutate(classification_ready_lump = fct_lump(classification_ready, n = 3))
+
+label_status <- read_csv('output_tables/label_status.csv')
+
+label_nmr <- read_csv('data/NMR_palsa_labeled_ready.csv') %>% 
+  pivot_longer(!c(Compound, KEGG_ID, Formula, Weight), 
+               names_to = 'SampleID', values_to = 'value') %>% 
+  mutate(label = ifelse(value > 0, 'Labeled', 'Non-labeled'))
+
+co2_data <- read_tsv('data/ProdCO2CH4Notstandardized.txt')
+```
+
+## Color vectors
+
+```{r}
+time_col <- c('#009FB7', '#DF8B36', '#688E26', '#B3001B')
+names(time_col) <- unique(levels(metadata$time))
+ellipse_col <- rep(as.character(time_col[c(2:4)]), 2)
+
+type_col <- c("#56A3A6", "#4059AD", "#F4442E")
+names(type_col) <- unique(levels(metadata$type))
+```
+
+## Getting samples lists
+
+```{r}
+treatments_df <- metadata %>% 
+  dplyr::select(time, type) %>% 
+  distinct %>% 
+  unite(t_name, time, type, sep = '_', remove = FALSE)
+
+sample_lists <- pmap(list(treatments_df$time,
+                          treatments_df$type),
+                     function(y, z){
+                       
+                       if(z == 'LO'){
+                         metadata %>%
+                           filter(type == z) %>% 
+                           pull(SampleID)
+                       } else {
+                         metadata %>% 
+                           filter(time == y,
+                                  type == z) %>% 
+                           pull(SampleID)
+                       }
+                       
+                     })
+names(sample_lists) <- treatments_df$t_name
+
+samples_peat <- sample_lists[str_detect(names(sample_lists), 'T[1|2|3]_PO')]
+samples_inc <- sample_lists[str_detect(names(sample_lists), 'PL')]
+```
+
+## Labeled metabolites in each treatment
+
+```{r}
+label_lists <- purrr::map(sample_lists, function(x){
+  unique(label_status %>% 
+           filter(SampleID %in% x,
+                  label_irreg == 'Labeled') %>% 
+           pull(FeatureID))
+})
+
+label_inc <- label_lists[str_detect(names(label_lists), 'PL')]
+
+nmr_label_list <- purrr::map(sample_lists, function(x){
+  unique(label_nmr %>% 
+           filter(SampleID %in% x,
+                  label == 'Labeled') %>% 
+           pull(Compound))
+})
+
+nmr_label_inc <- nmr_label_list[str_detect(names(nmr_label_list), 'PL')]
+```
+
+
+# 3. Normalizing data
+
+Not detected compounds are going to be assigned an intensity of 0
+
+## All LC-MS
+
+```{r}
+lcms_norm_abundance <- median.norm(lcms_abundance_table, transform_data = TRUE)  %>% 
+  pareto_scale(.)
+```
+
+## NMR
+
+```{r}
+nmr_norm_abundance <- median.norm(nmr_abundance_table) %>% 
+  pareto_scale(.)
+```
+
+## No litter
+
+```{r}
+lcms_abundance_nl <- lcms_abundance_table %>% 
+  dplyr::select(-PNE, -PNC, -Palsa_T0) %>% 
+  filter(rowSums(.) > 0) 
+
+lcms_norm_abundance_nl <- median.norm(lcms_abundance_nl) %>% 
+  pareto_scale(.)
+
+
+nmr_abundance_nl <- nmr_abundance_table %>% 
+  dplyr::select(-PNE, -PNC, -Palsa_T0) %>% 
+  filter(rowSums(.) > 0) 
+
+nmr_norm_abundance_nl <- median.norm(nmr_abundance_nl) %>% 
+  pareto_scale(.)
+```
+
+# 4. Analysis all samples
+
+
+```{r}
+
+norm_annotated <- lcms_norm_abundance %>% 
+  dplyr::select(-PNC, - PNE, -contains('C')) %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  pivot_longer(!FeatureID, names_to = 'SampleID', values_to = 'int') %>% 
+  left_join(lcms_annotation) %>% 
+  mutate(superclass = ifelse(is.na(superclass), 'No superclass assigned', superclass),
+         class = ifelse(is.na(class), 'No class assigned', class),
+         subclass = ifelse(is.na(subclass), 'No subclass assigned', subclass),
+         `level 5` = ifelse(is.na(`level 5`), 'Other', `level 5`)) %>% 
+  left_join(metadata) %>% 
+  group_by(FeatureID) %>% 
+  filter(time != 'T0') %>% 
+  mutate(zscore = (int - mean(int))/sd(int))
+
+zscore_mat <- norm_annotated %>% 
+  dplyr::select(FeatureID, SampleID, zscore) %>% 
+  pivot_wider(names_from = 'SampleID',
+              values_from = 'zscore') %>% 
+  column_to_rownames(var = 'FeatureID')
+
+zscore_hclust <- hclust(dist(zscore_mat))
+
+zscore_cut <- cutree(zscore_hclust, 2)
+
+zscore_order <- data.frame(FeatureID = names(zscore_cut),
+                           cluster = paste0('Cluster ', zscore_cut)) %>% 
+  mutate(trend = ifelse(cluster == 'Cluster 1', 'Reducing', 'Increasing'))
+
+zcore_plot <- norm_annotated %>% 
+  filter(superclass != 'No superclass assigned') %>% 
+  group_by(FeatureID, superclass, class, subclass, `level 5`, time) %>% 
+  summarise(zscore = mean(zscore)) %>% 
+  left_join(zscore_order) %>% 
+  ggplot(aes(x = time,
+             y = zscore,
+             color = trend)) +
+  geom_line(aes(group = FeatureID),
+            show.legend = FALSE) +
+  geom_point() +
+  facet_wrap2(~ superclass + `level 5`,
+              strip = strip_nested()) +
+  scale_color_manual(values = c('skyblue2', 'orange2')) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+
+zcore_plot
+```
+
+
+
+## 4.1 Distance matrices
+
+```{r}
+lcms_dist_mat <- vegdist(t(lcms_norm_abundance), method = 'manhattan')
+nmr_dist_mat <- vegdist(t(nmr_norm_abundance), method = 'manhattan')
+```
+
+## 4.2 PERMANOVA
+
+```{r}
+set.seed(123)
+permanova <- adonis2(lcms_dist_mat ~ time + type, 
+                     data=metadata, 
+                     permutations=999, 
+                     method="manhattan",
+                     by = 'terms')
+permanova
+```
+
+
+
+## 4.2 Ordinations
+
+Since litter samples are very different to other samples types, PCoA was used as it is better at showing global differences
+
+### LC-MS
+
+```{r}
+lcms_pcoa <- wcmdscale(lcms_dist_mat,
+                       add = 'cailliez', 
+                       eig = TRUE)
+
+eigen <- round(lcms_pcoa$eig / sum(lcms_pcoa$eig) * 100, 2)
+
+pcoa_coord_lcms <- as.data.frame(scores(lcms_pcoa, display = 'sites')) %>% 
+  rownames_to_column(var = 'SampleID') %>% 
+  inner_join(metadata, by = 'SampleID') %>% 
+  mutate(ellipse_group = case_when(time == 'T0' & type == 'LO' ~ 'g1',
+                                   time == 'T1' & type == 'PL' ~ 'g2',
+                                   TRUE ~ 'g3'))
+
+pcoa_plot_lcms <- pcoa_coord_lcms %>% 
+  ggplot(aes(x = Dim1,
+             y = Dim2)) +
+  geom_mark_ellipse(aes(fill = ellipse_group,
+                        color = ellipse_group),
+                    alpha = 0.05,
+                    linewidth = .3,
+                    show.legend = FALSE) +
+  scale_color_manual(values = c("#009FB7", "#DF8B36", 'gray50')) +
+  scale_fill_manual(values = c("#009FB7", "#DF8B36", 'gray50')) +
+  ggnewscale::new_scale_color() +
+  geom_point(aes(shape = type,
+                 color = time),
+             size = 1.3) +
+  geom_richtext(label =  paste0('**PERMANOVA**<br>', 
+                                '**Time:** *p-value* = ', permanova$`Pr(>F)`[1], '<br>',
+                                '**Sample Type:** *p-value* = ', permanova$`Pr(>F)`[2]),
+                x = 300,
+                y = 370,
+                hjust = 0,
+                vjust = 1,
+                size = 1.75) +
+  scale_color_manual(values = time_col) +
+  guides(fill = guide_legend(override.aes = list(shape = 21, color = NA))) +
+  labs(title = 'PCoA (LC-MS/MS)',
+       color = 'Time',
+       shape = 'Sample type',
+       x = paste0('Axis.1 (', eigen[1], '%)'),
+       y = paste0('Axis.2 (', eigen[2], '%)')) +
+  # coord_fixed(1) +
+  theme_bw() +
+  theme(plot.title = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 7),
+        legend.key.size = unit(0.3, 'lines'),
+        legend.key.spacing = unit(0.3, 'lines'))
+
+pcoa_plot_lcms
+# ggsave('output_figures/pcoa_lcms.png', pcoa_plot_lcms, dpi = 300, width = 8, height = 4)
+```
+
+### NMR 
+
+```{r}
+nmr_pcoa <- wcmdscale(nmr_dist_mat,
+                      add = 'cailliez', 
+                      eig = TRUE)
+
+eigen <- round(nmr_pcoa$eig / sum(nmr_pcoa$eig) * 100, 2)
+
+pcoa_coord_nmr <- as.data.frame(scores(nmr_pcoa, display = 'sites')) %>% 
+  rownames_to_column(var = 'SampleID') %>% 
+  inner_join(metadata, by = 'SampleID')
+
+pcoa_plot_nmr <- pcoa_coord_nmr %>% 
+  ggplot(aes(x = Dim1,
+             y = Dim2)) +
+  geom_mark_ellipse(aes(fill = interaction(time, type),
+                        color = interaction(time, type)),
+                    alpha = 0.05,
+                    linewidth = .5,
+                    show.legend = FALSE) +
+  scale_color_manual(values = rep(as.character(time_col), 2)) +
+  scale_fill_manual(values = rep(as.character(time_col), 2)) +
+  ggnewscale::new_scale_color() +
+  geom_point(aes(shape = type,
+                 color = time),
+             size = 3) +
+  scale_color_manual(values = time_col) +
+  guides(fill = guide_legend(override.aes = list(shape = 21, color = NA))) +
+  labs(title = 'PCoA (NMR)',
+       color = 'Time',
+       shape = 'Sample type',
+       x = paste0('Axis.1 (', eigen[1], '%)'),
+       y = paste0('Axis.2 (', eigen[2], '%)')) +
+  coord_fixed(1) +
+  theme_bw() +
+  theme(plot.title = element_text(face = 'bold', hjust = 0.5))
+
+pcoa_plot_nmr
+# ggsave('output_figures/pcoa_nmr.png', pcoa_plot_nmr, dpi = 300, width = 8, height = 4)
+```
+
+## 4.3 Heatmap LC-MS
+
+### Heatmap color function
+
+```{r}
+col_annot_df <- metadata %>% 
+  dplyr::select(SampleID, type, time) %>% 
+  filter(SampleID != 'Palsa_T0') %>% 
+  arrange(time) %>% 
+  column_to_rownames(var = 'SampleID')
+
+lcms_norm_matrix_ord <- median.norm(lcms_abundance_table[, rownames(col_annot_df)], 
+                                    transform_data = TRUE) %>% 
+  pareto_scale(.)
+
+htm_col <- circlize::colorRamp2(seq(min(lcms_norm_matrix_ord), 
+                                    max(lcms_norm_matrix_ord), 2), 
+                                viridis::inferno(13, 
+                                                 direction = 1, 
+                                                 begin = 0.2, 
+                                                 end = 0.8))
+```
+
+### Heatmap annotations
+
+```{r}
+ca1 <- columnAnnotation(df = col_annot_df,
+                        col = list(type = type_col,
+                                   time = time_col),
+                        annotation_name_gp = gpar(fontsize = 6),
+                        annotation_legend_param = list(labels_gp = gpar(fontsize = 6),
+                                                       title_gp = gpar(fontsize = 7)))
+```
+
+### Plotting heatmap
+
+```{r}
+
+col_dend <- as.dendrogram(hclust(dist(t(lcms_norm_matrix_ord), 'manhattan')))
+col_dend_rot <- dendextend::rotate(col_dend, 3)
+plot(col_dend_rot)
+
+ht <- Heatmap(lcms_norm_matrix_ord,
+              col = htm_col,
+              #clustering_distance_columns = 'manhattan',
+              cluster_columns = col_dend_rot,
+              name = 'Normalized\nabundance',
+              row_split = 4,
+              column_split = 5,
+              column_title = NULL,
+              row_title = NULL,
+              show_row_names = FALSE,
+              top_annotation = ca1,
+              # left_annotation = ra1,
+              #right_annotation = ra2,
+              column_names_rot = 45,
+              column_names_centered = FALSE,
+              column_names_gp = gpar(fontsize = 6),
+              heatmap_legend_param = list(labels_gp = gpar(fontsize = 6),
+                                          title_gp = gpar(fontsize = 7))
+)
+
+ht
+
+ht_grob <- grid.grabExpr(draw(ht))
+```
+
+## 4.4 CO2 measurements
+
+```{r}
+co2_plot <- co2_data %>%
+  filter(Habitat == 'Palsa') %>% 
+  mutate(Type = case_when(Type == 'Control' ~ 'Peat',
+                          Type == 'Enriched' ~ 'Peat + Labeled Litter',
+                          Type == 'Natural' ~ 'Peat + Unlabeled Litter')) %>% 
+  group_by(SampleDay, Type) %>% 
+  summarise(co2 = mean(TotalCO2.ug.day),
+            co2_sd = sd(TotalCO2.ug.day)) %>% 
+  ggplot(aes(x = SampleDay)) +
+  geom_point(aes(y = co2,
+                 color = Type),
+             size = 1.3) +
+  geom_line(aes(y = co2,
+                color = Type),
+            linewidth = .5) +
+  geom_errorbar(aes(ymax = co2 + co2_sd,
+                    ymin = co2 - co2_sd,
+                    color = Type),
+                linewidth = 0.5,
+                width = .8,
+                alpha = .8) +
+  scale_color_manual(values = c('#779FA1', '#A01D33', '#25256F')) +
+  ggnewscale::new_scale_color() +
+  geom_vline(data = data.frame(x = c(7, 18, 40),
+                               time = c('T1', 'T2', 'T3')),
+             aes(xintercept = x,
+                 color = time),
+             linetype = 2,
+             linewidth = .5,
+             show.legend = FALSE) +
+  scale_color_manual(values = time_col[2:4]) +
+  labs(y = 'CO2 [ug C/g Soil/day]',
+       x = 'Day') +
+  theme_bw() +
+  theme(plot.title = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 7),
+        legend.key.size = unit(0.3, 'lines'),
+        legend.key.spacing = unit(0.3, 'lines'))
+
+co2_plot
+```
+
+## 4.5 Joining Figure 3
+
+```{r}
+design <- "
+AB
+AC
+"
+
+figure_3 <- wrap_elements(full = ht_grob, clip = FALSE) + co2_plot + pcoa_plot_lcms +
+  plot_layout(design = design, widths = c(2.2, 1)) +
+  plot_annotation(tag_levels = 'A') &
+  theme(plot.tag = element_text(size = 8, face = 'bold'))&
+  theme(legend.position = 'bottom',
+        legend.title.position = 'top')
+
+figure_3
+
+ggsave('updated_figures/Figure3.svg', figure_3, dpi = 300,
+       unit = 'mm', height = 120, width = 180)
+```
+
+
+# 5 Analysis without T0
+
+```{r}
+lcms_dist_mat_nl <- vegdist(t(lcms_norm_abundance_nl), method = 'bray')
+
+nmr_dist_mat_nl <- vegdist(t(nmr_norm_abundance_nl), method = 'bray')
+```
+
+## 5.1 PERMANOVA
+
+Not using litter
+
+```{r warning=FALSE}
+metadata_nl <- metadata %>% 
+  filter(type != 'LO',
+         time != 'T0') %>% 
+  unite(time_type, time, type, sep = '_', remove = FALSE) %>% 
+  mutate(cgroup = case_when(time_type == 'T1_PL' ~ 'T1_PL',
+                            str_detect(time_type, 'PL') ~ 'PL',
+                            TRUE ~ 'PO'))
+
+```
+
+## 5.2 NMDS
+
+```{r}
+set.seed(999)
+nmds <- metaMDS(lcms_dist_mat_nl,
+                k = 2,
+                distance = 'bray',
+                maxit = 999,
+                trymax = 500,
+                wascores = TRUE)
+
+stressplot(nmds)
+
+permanova_nl <- adonis2(lcms_dist_mat_nl ~ cgroup, 
+                        data=metadata_nl, 
+                        permutations=999, 
+                        method="manhattan")
+
+permanova_nl
+```
+
+Extracting NMDS scores and plotting
+
+```{r}
+nmds_scores <- as.data.frame(scores(nmds, display = 'sites')) %>% 
+  rownames_to_column(var = 'SampleID') %>% 
+  inner_join(metadata_nl, by = 'SampleID')
+
+nmds_plot <- nmds_scores %>% 
+  ggplot(aes(x = NMDS1,
+             y = NMDS2)) +
+  geom_mark_ellipse(aes(group = cgroup),
+                    alpha = 0.1,
+                    show.legend = FALSE) +
+  scale_color_manual(values = ellipse_col) +
+  scale_fill_manual(values = ellipse_col) +
+  ggnewscale::new_scale_color() +
+  geom_point(aes(shape = type,
+                 color = time),
+             size = 4) +
+  scale_color_manual(values = time_col[c(2:4)]) +
+  guides(fill = guide_legend(override.aes = list(shape = 21, color = NA))) +
+  geom_richtext(label =  paste0('**stress =** ', round(nmds$stress, 4), '<br>',
+                                '**Time:** *p-value* = ', permanova_nl$`Pr(>F)`[1]),
+                x = 0.05,
+                y = -0.02,
+                hjust = 0,
+                vjust = 1,
+                size = 2) +
+  labs(title = 'NMDS plot',
+       color = 'Time',
+       shape = 'Sample type') +
+  coord_fixed(1) +
+  theme_bw() +
+  theme(plot.title = element_text(face = 'bold', hjust = 0.5))
+nmds_plot
+
+ggsave('output_figures/Supp1.png', nmds_plot, dpi = 300, width = 8, height = 4)
+```
+
+## 5.3 DIABLO
+
+### Creating design matrix
+
+```{r} 
+X <- list(LC_MS = t(lcms_norm_abundance_nl[, metadata_nl$SampleID]),
+          NMR = t(nmr_norm_abundance_nl[,metadata_nl$SampleID]))
+
+Y <- as.character(metadata_nl$type)
+
+# Testing correlations
+
+res1 <- pls(t(lcms_norm_abundance_nl[, metadata_nl$SampleID]), 
+            t(nmr_norm_abundance_nl[,metadata_nl$SampleID]), 
+            ncomp = 1)
+cor(res1$variates$X, res1$variates$Y)
+des <- matrix(c(0.9, 0.9, 0.9, 0.9), nrow = 2) # For predictive task
+```
+
+### Tuning
+
+```{r} 
+# diablo_palsa <- block.plsda(X, Y, ncomp = 5, design = des)
+# 
+# perf.diablo_palsa <- perf(diablo_palsa, validation = 'Mfold', 
+#                           folds = 10, 
+#                           nrepeat = 100, 
+#                           cpus = 10)
+# 
+# plot(perf.diablo_palsa)
+# 
+# perf.diablo_palsa$choice.ncomp$WeightedVote
+# ncomp <- perf.diablo_palsa$choice.ncomp$WeightedVote['Overall.BER', 'mahalanobis.dist']
+# 
+# # Note: ncomp <- 5 was selected
+# 
+# test.keep.X <- list(LC_MS = c(seq(10, 30, 5)),
+#                     NMR = c(5:9, seq(10, 20, 5)))
+# 
+# # Commented out to save time
+# tune.diablo_palsa <- tune.block.splsda(X, Y,
+#                                        ncomp = ncomp,
+#                                        test.keepX = test.keep.X,
+#                                        design = des,
+#                                        validation = 'Mfold',
+#                                        folds = 5,
+#                                        nrepeat = 10,
+#                                        max.iter = 200,
+#                                        measure = 'overall',
+#                                        BBPARAM = BiocParallel::SnowParam(workers = 10),
+#                                        dist = 'mahalanobis.dist')
+# 
+# saveRDS(tune.diablo_palsa, 'tune.diablo_palsa.rds')
+
+tune.diablo_palsa <- readRDS('tune.diablo_palsa.rds')
+ncomp <- 5
+list.keepX <- tune.diablo_palsa$choice.keepX
+# list.keepX <- list(LC_MS = c(25, 10, 10, 20, 15),
+#                    NMR = c(6, 6, 20, 20, 9))
+
+```
+
+### Running tuned model
+
+```{r}
+diablo_palsa_final <- block.splsda(X, Y, 
+                                   ncomp = ncomp,
+                                   keepX = list.keepX, 
+                                   design = des)
+
+plotIndiv(diablo_palsa_final, 
+          blocks = 'LC_MS',
+          comp = c(3, 4))
+
+lo_pl_indiv <- plotIndiv(diablo_palsa_final, 
+                         blocks = 'weighted.average',
+                         plot = F)
+
+diablo_scores <- lo_pl_indiv$df %>% 
+  rownames_to_column(var = 'SampleID') %>% 
+  inner_join(metadata_nl, by = 'SampleID')
+
+diablo_plot <- diablo_scores %>% 
+  ggplot(aes(x = x,
+             y = y)) +
+  geom_mark_ellipse(aes(fill = type,
+                        color = type),
+                    alpha = 0.1,
+                    show.legend = FALSE) +
+  scale_color_manual(values = type_col) +
+  scale_fill_manual(values = type_col) +
+  #ggnewscale::new_scale_color() +
+  geom_point(aes(shape = type,
+                 color = type),
+             size = 2) +
+  #scale_color_manual(values = time_col[c(2:4)]) +
+  labs(x = 'Average variate 1\n(LC-MS/MS : 18%; NMR: 15%)',
+       y = 'Average variate 2\n(LC-MS/MS : 18%; NMR: 12%)',
+       color = 'Sample type',
+       shape = 'Sample type') +
+  # coord_fixed(1) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 7),
+        legend.key.size = unit(0.3, 'lines'),
+        legend.key.spacing = unit(0.3, 'lines'),
+        legend.position = 'bottom')
+
+diablo_plot
+```
+
+### Extracting loadings
+
+#### LC-MS
+
+```{r}
+lc_loadings_c1 <- as.data.frame(diablo_palsa_final$loadings$LC_MS) %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  mutate(abs_c1 = abs(comp1)) %>% 
+  slice_max(abs_c1, n = 25) %>% 
+  inner_join(lcms_annotation, by = 'FeatureID') %>% 
+  mutate(contrib = if_else(comp1 > 0, 'PO', 'PL'),
+         mol_class = str_replace(class_lump, 'and ', 'and\n'),
+         dataset = 'LC-MS/MS') %>% 
+  select(FeatureID, comp1, abs_c1, contrib, mol_class, dataset)
+
+lc_loadings_c1_ab <- lc_loadings_c1 %>% 
+  select(-abs_c1) %>% 
+  left_join(rownames_to_column(lcms_norm_abundance, var = 'FeatureID'),
+            by = 'FeatureID')
+
+lc_loadings_log2 <- lcms_abundance_table %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  pivot_longer(!FeatureID, names_to = 'SampleID', values_to = 'abundance') %>% 
+  inner_join(metadata, by = 'SampleID') %>%
+  filter(type != 'LO') %>% 
+  group_by(FeatureID) %>% 
+  filter(sum(abundance) != 0) %>% 
+  group_by(FeatureID, time, type) %>% 
+  summarise(mean_ab = mean(abundance)) %>% 
+  group_by(FeatureID) %>% 
+  nest() %>% 
+  mutate(log2_changes = purrr::map(data, function(df){
+    
+    df$mean_ab[df$mean_ab == 0] <- min(df$mean_ab[df$mean_ab != 0])/10
+    
+    df_po <- df %>% 
+      filter(type == 'PO')
+    
+    df_pl <- df %>% 
+      filter(type == 'PL')
+    
+    values_po <- set_names(df_po$mean_ab,
+                           nm = df_po$time)
+    
+    values_pl <- set_names(df_pl$mean_ab,
+                           nm = df_pl$time)
+    
+    new_df <- tribble(
+      ~time, ~type, ~LFC,
+      'T0', 'PO', log2(values_po['T0'] / values_po['T0']),
+      'T1', 'PO', log2(values_po['T1'] / values_po['T0']),
+      'T2', 'PO', log2(values_po['T2'] / values_po['T0']),
+      'T3', 'PO', log2(values_po['T3'] / values_po['T0']),
+      'T0', 'PL', log2(values_po['T0'] / values_po['T0']),
+      'T1', 'PL', log2(values_pl['T1'] / values_po['T0']),
+      'T2', 'PL', log2(values_pl['T2'] / values_po['T0']),
+      'T3', 'PL', log2(values_pl['T3'] / values_po['T0']),
+    )
+    
+    return(new_df)
+  })) %>% 
+  dplyr::select(-data) %>% 
+  unnest(cols = c(log2_changes)) %>% 
+  mutate(dataset = 'LC-MS/MS')
+
+```
+
+#### NMR
+
+```{r}
+nmr_loadings_c1 <- as.data.frame(diablo_palsa_final$loadings$NMR) %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  mutate(abs_c1 = abs(comp1)) %>% 
+  slice_max(abs_c1, n = 6) %>% 
+  mutate(contrib = if_else(comp1 > 0, 'PO', 'PL'),
+         mol_class = 'NMR',
+         dataset = 'NMR') %>% 
+  select(FeatureID, comp1, abs_c1, contrib, mol_class, dataset)
+
+nmr_loadings_c1_ab <- nmr_loadings_c1 %>% 
+  select(-abs_c1) %>% 
+  left_join(rownames_to_column(nmr_norm_abundance, var = 'FeatureID'),
+            by = 'FeatureID')
+
+all_loadings_table <- rbind(lc_loadings_c1_ab, nmr_loadings_c1_ab)
+
+write_csv(all_loadings_table, 'output_tables/Supplementary_table2.csv')
+
+all_loadings_plot <-  rbind(lc_loadings_c1, nmr_loadings_c1) %>% 
+  ggplot() +
+  geom_col(aes(y = fct_reorder(FeatureID, rev(abs_c1)),
+               x = comp1,
+               fill = contrib)) +
+  scale_fill_manual(values = type_col) +
+  facet_nested(dataset + mol_class ~ ., 
+               scales = 'free', 
+               space = 'free',
+               switch = 'y',
+               strip = strip_nested(
+                 background_y = list(element_rect(fill = '#80a1c1'),
+                                     element_rect(fill = '#eee3ab'),
+                                     element_blank(),
+                                     element_blank(),
+                                     element_blank(),
+                                     element_blank(),
+                                     element_blank(),
+                                     element_blank(),
+                                     element_blank()),
+                 text_y = elem_list_text(angle = c(90, 90, rep(0, 7)))
+               )) +
+  labs(x = 'Contribution to variate 1',
+       fill = 'Max abundance') +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        strip.text = element_text(size = 6),
+        strip.placement = 'outer',
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title.x = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 7),
+        legend.key.size = unit(0.3, 'lines'),
+        legend.key.spacing = unit(0.3, 'lines'),
+        legend.position = 'bottom')
+
+all_loadings_plot
+  
+
+nmr_loadings_log2 <- nmr_abundance_table %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  pivot_longer(!FeatureID, names_to = 'SampleID', values_to = 'abundance') %>% 
+  inner_join(metadata, by = 'SampleID') %>%
+  filter(type != 'LO') %>% 
+  group_by(FeatureID) %>% 
+  filter(sum(abundance) != 0) %>% 
+  group_by(FeatureID, time, type) %>% 
+  summarise(mean_ab = mean(abundance)) %>% 
+  group_by(FeatureID) %>% 
+  nest() %>% 
+  mutate(log2_changes = purrr::map(data, function(df){
+    
+    df$mean_ab[df$mean_ab == 0] <- min(df$mean_ab[df$mean_ab != 0])/10
+    
+    df_po <- df %>% 
+      filter(type == 'PO')
+    
+    df_pl <- df %>% 
+      filter(type == 'PL')
+    
+    values_po <- set_names(df_po$mean_ab,
+                           nm = df_po$time)
+    
+    values_pl <- set_names(df_pl$mean_ab,
+                           nm = df_pl$time)
+    
+    new_df <- tribble(
+      ~time, ~type, ~LFC,
+      'T0', 'PO', log2(values_po['T0'] / values_po['T0']),
+      'T1', 'PO', log2(values_po['T1'] / values_po['T0']),
+      'T2', 'PO', log2(values_po['T2'] / values_po['T0']),
+      'T3', 'PO', log2(values_po['T3'] / values_po['T0']),
+      'T0', 'PL', log2(values_po['T0'] / values_po['T0']),
+      'T1', 'PL', log2(values_pl['T1'] / values_po['T0']),
+      'T2', 'PL', log2(values_pl['T2'] / values_po['T0']),
+      'T3', 'PL', log2(values_pl['T3'] / values_po['T0']),
+    )
+    
+    return(new_df)
+  })) %>% 
+  dplyr::select(-data) %>% 
+  unnest(cols = c(log2_changes)) %>% 
+  mutate(dataset = 'NMR')
+
+```
+
+```{r}
+nmr_norm_abundance %>% 
+  rownames_to_column(var = 'ID') %>% 
+  pivot_longer(!ID, names_to = 'SampleID',
+               values_to = 'value') %>% 
+  left_join(metadata, by = 'SampleID') %>% 
+  filter(ID == 'Acetate') %>% 
+  ggplot() +
+  geom_point(aes(x = type,
+                 y = value,
+                 color = type)) +
+  facet_grid(cols = vars(time), scales = 'free_x') +
+  theme_bw()
+
+```
+
+
+#### Plotting log2 fold change of selected components
+
+```{r}
+# labels_log2 <- rbind(lc_loadings_log2, nmr_loadings_log2) %>% 
+#   filter(time == 'T3')
+
+log2_info <- rbind(lc_loadings_log2, nmr_loadings_log2) %>% 
+  filter(time != 'T0')
+
+# log2_info_annotated <- log2_info %>% 
+#   dplyr::select(FeatureID) %>% 
+#   distinct() %>% 
+#   inner_join(lcms_annotation) 
+# 
+# class_color <- set_names(get_palette('Paired', 11),
+#                          nm = unique(lcms_annotation$class_lump))
+# 
+# log2_tiles <- log2_info %>%
+#   group_by(FeatureID, dataset, type) %>%
+#   mutate(mean_LFC = mean(LFC, na.rm = TRUE)) %>%
+#   arrange(mean_LFC) %>%
+#   ungroup() %>%
+#   mutate(order = n():1,
+#          LFC = ifelse(LFC > 5, 5, LFC),
+#          LFC = ifelse(LFC < -5, -5, LFC)) %>%
+#   left_join(dplyr::select(log2_info_annotated, FeatureID, class_lump)) %>%
+#   mutate(hl_color = class_color[class_lump],
+#          hl_color = ifelse(is.na(hl_color), 'black', hl_color),
+#          new_label = glue("<span style='color:{hl_color}'>{FeatureID}</span>")) %>% 
+#   ggplot() +
+#   geom_tile(aes(x = time,
+#                 y = fct_reorder(FeatureID, order),
+#                 fill = LFC),
+#             color = 'white') +
+#   scale_fill_distiller(palette = 'RdBu') +
+#   scale_x_discrete(expand = c(0, 0)) +
+#   scale_y_discrete(expand = c(0, 0)) +
+#   facet_grid(rows = vars(dataset),
+#              cols = vars(type),
+#              scales = 'free_y',
+#              space = 'free_y') +
+#   labs(y = 'FeatureID') +
+#   theme_bw() +
+#   theme(axis.text.y = element_markdown())
+# 
+# log2_tiles
+
+```
+
+### Potential priming metabolites
+
+```{r}
+priming <- log2_info %>% 
+  unite(time_type, time, type) %>% 
+  pivot_wider(names_from = time_type, values_from = LFC) %>% 
+  filter(T2_PO > T2_PL & T3_PO > T3_PL,
+         T3_PL < 0) 
+
+lcms_label_feat_df <- imap(label_lists, function(x, y){
+  df <- tibble(FeatureID = x) %>% 
+    mutate(type_time = y,
+           label = 'Labeled')
+}) %>% 
+  reduce(rbind) %>% 
+  separate(type_time, into = c('time', 'type'), sep = '_')
+
+nmr_label_feat_df <- imap(nmr_label_list, function(x, y){
+  df <- tibble(FeatureID = x) %>% 
+    mutate(type_time = y,
+           label = 'Labeled')
+}) %>% 
+  reduce(rbind) %>% 
+  separate(type_time, into = c('time', 'type'), sep = '_')
+
+all_label_feat_df <- rbind(lcms_label_feat_df, nmr_label_feat_df)
+
+feat_class <- lcms_annotation %>% 
+  dplyr::select(FeatureID, final_name, class_lump, subclass, `level 5`)
+
+potential_priming <- rbind(lc_loadings_log2, nmr_loadings_log2) %>%
+  left_join(all_label_feat_df) %>% 
+  mutate(label = ifelse(is.na(label), 'Non-label', label)) %>%
+  left_join(feat_class) %>% 
+  mutate(split = case_when((dataset == 'LC-MS/MS' & is.na(class_lump)) ~ 'No annotation',
+                           dataset == 'NMR' ~ 'NMR',
+                           TRUE ~ class_lump)) #%>% 
+# split(.$split)  
+
+strip_fill <- strip_themed(
+  background_x = elem_list_rect(fill = c('gray', 'gray', 'gray', 'gray', 'tan1', 'tan1'))
+)
+
+priming_plot <- potential_priming %>% 
+  filter(FeatureID %in% lc_loadings_c1$FeatureID,
+         dataset != 'NMR') %>% 
+  # filter(FeatureID %in% c("MW_672.17446@RT_28.644",
+  #                         "MW_624.17009@RT_27.610",
+  #                         "MW_490.27804@RT_34.489" ,
+  #                         "MW_594.15921@RT_19.928",
+  #                         "MW_600.29758@RT_35.204",
+  #                         "MW_416.18697@RT_37.918")) %>%
+  # mutate(subclass = if_else(FeatureID == "MW_416.18697@RT_37.918", 
+  #                           'Subclass of\nPyrrolopyrimidine', subclass),
+  #        subclass = str_replace(subclass, 'and ', 'and\n'),
+  #        FeatureID = glue('{FeatureID}\n({class})',
+  #                         FeatureID = FeatureID,
+  #                         class = subclass)) %>% 
+  ggplot(aes(x = time,
+             y = LFC,
+             color = type)) +
+  geom_hline(yintercept = 0) +
+  geom_line(aes(group = interaction(FeatureID, type))) +
+  scale_color_manual(values = type_col) +
+  geom_point(aes(shape = label),
+             size = 2,
+             fill = 'white') +
+  scale_shape_manual(values = c('Labeled' = 16, 'Non-label' = 21)) +
+  facet_wrap2(~FeatureID, nrow = 2, scales = 'free_y',
+              strip = strip_fill) +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        panel.grid = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title.y = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 7),
+        legend.key.size = unit(0.3, 'lines'),
+        legend.key.spacing = unit(0.3, 'lines'),
+        strip.text = element_text(size = 6),
+        legend.position = 'bottom',
+        legend.title.position = 'top')
+
+priming_plot
+
+```
+
+## Figure 4
+
+```{r}
+des <- "
+AB
+CD
+"
+
+fig4 <- diablo_plot + free(all_loadings_plot) + CO2Palsa + free(priming_plot) +
+  plot_layout(design = des, widths = c(1, 3)) +
+  plot_annotation(tag_levels = 'A')
+
+fig4
+
+ggsave('updated_figures/Figure4.svg', fig4, dpi = 300,
+       unit = 'mm', height = 180, width = 180)
+
+```
+
+
+# Abundance class
+
+```{r}
+abundance_class <- lcms_abundance_table %>% 
+  rownames_to_column(var = 'FeatureID') %>% 
+  pivot_longer(!FeatureID, names_to = 'SampleID',
+               values_to = 'norm_abundance') %>% 
+  inner_join(metadata) %>% 
+  inner_join(lcms_annotation)
+
+abundance_class_plot <- abundance_class %>% 
+  group_by(time, type, FeatureID, class_lump, classification_ready_lump) %>% 
+  summarise(mean_abun = mean(norm_abundance)) %>% 
+  mutate(classification_ready_lump = if_else(class_lump == 'Prenol lipids', 'All prenol lipids',
+                                             classification_ready_lump),
+         classification_ready_lump = str_replace(classification_ready_lump, ' of ', '\nof ')) %>% 
+  filter(!str_detect(class_lump, 'Other'),
+         class_lump != 'No annotation',
+         #time != 'T0',
+         !str_detect(classification_ready_lump, 'Other')) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = time,
+                   y = log2(mean_abun),
+                   fill = type)) +
+  facet_wrap2(~ class_lump + classification_ready_lump,
+              scales = 'free',
+              #space = 'free',
+              strip = strip_nested()) +
+  labs(y = 'Log2(abundance)') +
+  scale_fill_manual(values = type_col) +
+  theme_bw() +
+  theme(strip.text.y = element_text(angle = 0))
+
+abundance_class_plot
+
+ggsave('output_figures/Supp2.png', abundance_class_plot, dpi = 300, width = 10, height = 6.5)
+```
+

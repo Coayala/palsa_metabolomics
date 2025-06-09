@@ -1,0 +1,733 @@
+---
+title: "Data preprocessing"
+author: "Christian Ayala"
+date: Sys.date()
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: '2'
+    collapsed: false
+    highlight: tango
+    css: style.css
+---
+
+# 1. Setup
+
+## Importing libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(readxl)
+library(ggpubr)
+library(patchwork)
+library(tidyverse)
+library(ggh4x)
+source('functions_cdis_exploration.R')
+```
+
+## Setting project folders
+
+```{r}
+# Give a name for your project so the results are all grouped together in a directory with the same name
+figures_dir <- 'output_figures'
+tables_dir <- 'output_tables'
+
+# Create output directories
+if(!dir.exists(figures_dir)) dir.create(figures_dir, showWarnings = FALSE)
+if(!dir.exists(tables_dir)) dir.create(tables_dir, showWarnings = FALSE)
+```
+
+# 2. Loading data
+
+## LC-MS data
+
+```{r message=FALSE}
+# Import data tables
+
+cd_results_table <- read_xlsx('data/CD_results_palsa_1.5e6_old_al_node.xlsx') %>%
+  mutate(Name = ifelse(abs(`Annot. DeltaMass [ppm]`) > 5, NA, Name),
+         Formula = ifelse(abs(`Annot. DeltaMass [ppm]`) > 5, NA, Formula)) %>% 
+  mutate(MW = formatC(round(`Calc. MW`, 5), digits = 5, format = 'f'),
+         RT = formatC(round(`RT [min]`, 3), digits = 3, format = 'f'),
+         FeatureID = paste0('MW_', MW, '@RT_', RT),
+         Name = ifelse(is.na(Name), FeatureID, Name)) %>%
+  select(FeatureID, Name, Formula, MW, mz = `m/z`, contains('Area:'), 
+         contains('Labeling Status:'),
+         contains('Rel. Exchange'),
+         contains('Peak Rating')) %>% 
+  #filter(if_any(contains('Peak Rating'), ~.x > 5)) %>% 
+  rename_with(function(.x){
+    y <- str_remove(.x, 'Saleska_') %>% 
+      str_remove('_26Jan.*')
+    return(y)
+  }) %>% 
+  select(-contains('Peak Rating'))
+
+# Import metadata and fix names
+
+metadata <- read_csv('data/metadata_palsa_labeled.csv') %>% 
+  mutate(sample_type = str_replace(sample_type, 'Sample', 'Unlabeled'),
+         type = factor(type, levels = c('LO', 'PL', 'PO')),
+         time = factor(time, levels = c('T0', 'T1', 'T2', 'T3')))
+
+```
+
+## NMR data
+
+```{r message=FALSE}
+nmr_data <- read_csv('data/NMR_palsa_all.csv') %>% 
+  select(FeatureID = Compound, Name = Compound, MW = Weight, 
+         Formula, KEGG_ID, all_of(metadata$SampleID))
+
+nmr_label <- read_csv('data/NMR_palsa_labeled_ready.csv')
+
+
+nmr_label %>% 
+  rename(FeatureID = Compound) %>% 
+  dplyr::select(-KEGG_ID, -Formula, - Weight) %>% 
+  pivot_longer(!FeatureID, names_to = 'SampleID', values_to = 'value') %>% 
+  mutate(Label = ifelse(value > 0, 'Labeled', 'Non_labeled')) %>% 
+  dplyr::select(-value) %>% 
+  write_csv('output_tables/Supplementary Table 6.csv')
+```
+
+## Annotation data 
+
+```{r}
+lcms_annotation_final <- read_csv('output_tables/lcms_annotation_final.csv')  %>% 
+  mutate(classification_ready = case_when(
+    is.na(kingdom) ~ 'No annotation',
+    is.na(`level 5`) & is.na(subclass) & is.na(class) & is.na(superclass) ~ 
+      paste0('Other superclass of ', kingdom),
+    is.na(`level 5`) & is.na(subclass) & is.na(class) ~ 
+      paste0('Other class of ', superclass),
+    is.na(`level 5`) & is.na(subclass) ~ 
+      paste0('Other subclass of ', class),
+    is.na(`level 5`)  ~ 
+      paste0('Other ', subclass),
+    TRUE ~ `level 5`
+  ),
+  class_fill = case_when(is.na(class) & !is.na(superclass) ~ 
+                           paste0('Other class of ', superclass),
+                         is.na(class) & is.na(superclass) ~ 'No annotation',
+                         TRUE ~ class),
+  class_lump = fct_lump(class_fill, n = 10)) %>% 
+  group_by(class_lump) %>% 
+  mutate(classification_ready_lump = fct_lump(classification_ready, n = 3))
+```
+
+
+# 3. Rearranging data and calculating indexes for LC-MS data
+
+## Creating abundance table
+
+```{r}
+lcms_abundance_table <- cd_results_table %>% 
+  select(FeatureID, contains('Area')) %>% 
+  rename_with(~str_remove(.x, 'Area: ')) %>% 
+  mutate(across(everything(), ~ifelse(is.na(.x), 0, .x)))
+
+# write_csv(lcms_abundance_table , 'output_tables/lcms_abundance_table.csv')
+```
+
+## Separating label information
+
+```{r}
+label_status <- cd_results_table %>% 
+  select(FeatureID, 
+         contains('Labeling Status:'), 
+         contains('Rel. Exchange')) %>% 
+  pivot_longer(!FeatureID, names_to = c('.value', 'SampleID'), 
+               names_pattern = '(.*): (.*)')  %>% 
+  mutate(label_nw = 
+           case_when(`Labeling Status` == 'No warnings' & 
+                       `Rel. Exchange [%]` > 5 ~ 'Labeled',
+                     `Labeling Status` == 'Not detected' ~ 'Not_detected',
+                     TRUE ~ 'Non_labeled'),
+         label_irreg = 
+           case_when((`Labeling Status` == 'No warnings' & 
+                        `Rel. Exchange [%]` > 5) |
+                       (`Labeling Status` == 'Irregular exchange' & 
+                          `Rel. Exchange [%]` > 15) ~ 'Labeled',
+                     `Labeling Status` == 'Not detected' ~ 'Not_detected',
+                     TRUE ~ 'Non_labeled')) %>% 
+  mutate(label_nw = factor(label_nw, 
+                           levels = c('Not_detected', 
+                                      'Non_labeled', 
+                                      'Labeled')),
+         label_irreg = factor(label_irreg, 
+                              levels = c('Not_detected', 
+                                         'Non_labeled', 
+                                         'Labeled')))
+
+# write_csv(label_status, 'output_tables/label_status.csv')
+```
+
+
+InChIKeys and KEGG annotations were retrieved manually.
+
+# 4. Exploratory plots
+
+## Setting colors for treatments for all file
+
+```{r}
+sample_type_col <- get_palette(palette = 'Dark2', 2)
+names(sample_type_col) <- unique(metadata$sample_type)
+
+type_col <- c("#56A3A6", "#4059AD", "#F4442E")
+names(type_col) <- unique(levels(metadata$type))
+
+time_col <- c('#009FB7', '#DF8B36', '#688E26', '#B3001B')
+names(time_col) <- unique(levels(metadata$time))
+```
+
+## Checking which compounds are labeled
+
+#### NMR
+
+```{r}
+nmr_compounds_labeled <- nmr_label %>% 
+  select(any_of(metadata$SampleID)) %>% 
+  pivot_longer(any_of(metadata$SampleID), names_to = 'SampleID',
+               values_to = 'values') %>% 
+  filter(values > 0) %>% 
+  count(SampleID)
+
+nmr_label_status <- tibble(SampleID = metadata$SampleID, 
+                           total = rep(45, length(metadata$SampleID))) %>% 
+  left_join(nmr_compounds_labeled, by = 'SampleID') %>% 
+  rename(Labeled = n) %>% 
+  mutate(Labeled = ifelse(is.na(Labeled), 0, Labeled)) %>% 
+  mutate(Non_labeled = total - Labeled) %>% 
+  pivot_longer(c(Labeled, Non_labeled), names_to = 'Label status', 
+               values_to = 'n') %>% 
+  mutate(`Label status` = factor(`Label status`, 
+                                 levels = c('Non_labeled', 'Labeled'))) %>% 
+  filter(n > 0) %>% 
+  left_join(metadata) %>% 
+  ggplot() +
+  geom_col(aes(x = SampleID,
+               y = n,
+               fill = `Label status`),
+           color = 'black',
+           linewidth = 0.1) +
+  scale_fill_manual(values = c(Labeled = '#ffb639', 
+                               Non_labeled = '#006889'
+  )) +
+  theme_bw() +
+  scale_y_continuous(expand = c(0,1)) +
+  facet_grid(cols = vars(time),
+             scales = 'free',
+             space = 'free') +
+  labs(y = '# of Features',
+       fill = "Label status",
+       # title = 'Number of features detected per sample',
+       subtitle = 'NMR') +
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_blank(),
+    plot.subtitle = element_text(face = 'italic', hjust = 0.5, size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size = 6),
+    axis.title.y = element_text(size = 7),
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 6),
+    strip.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'lines'),
+    panel.grid = element_blank())
+
+nmr_label_status
+```
+
+#### LC-MS
+
+```{r}
+shared_labeled_df <- label_status %>% 
+  pivot_longer(contains('label_'), names_to = 'detection', 
+               values_to = 'label_status') %>% 
+  filter(detection == 'label_irreg',
+         SampleID != 'Palsa_T0',
+         label_status != 'Not_detected') %>% 
+  select(SampleID, FeatureID, label_status) %>% 
+  distinct() %>% 
+  mutate(val = TRUE) %>% 
+  left_join(metadata, by = 'SampleID') %>%
+  filter(label_status == 'Labeled',
+         type != 'PO') %>% 
+  #unite(type, type, time) %>% 
+  select(FeatureID, label_status, type, val) %>%  
+  distinct()%>% 
+  pivot_wider(names_from = type, values_from = val, values_fill = FALSE) 
+
+shared_labeled <- shared_labeled_df %>% 
+  ggvenn::ggvenn(columns = c('LO', 'PL'),
+                 text_size = 3,
+                 set_name_size = 2.5,
+                 fill_color = c("#56A3A6", "#F4442E"),
+                 auto_scale = TRUE,
+                 stroke_size = .5) +
+  coord_flip()
+
+shared_labeled
+
+
+label_plot <- label_status %>% 
+  pivot_longer(contains('label_'), names_to = 'detection', 
+               values_to = 'label_status') %>% 
+  filter(detection == 'label_irreg',
+         SampleID != 'Palsa_T0',
+         label_status != 'Not_detected') %>%
+  group_by(SampleID, detection) %>% 
+  count(label_status) %>% 
+  left_join(metadata) %>% 
+  ggplot() +
+  geom_col(aes(x = SampleID,
+               y = n,
+               fill = label_status),
+           color = 'black',
+           linewidth = 0.1) +
+  scale_fill_manual(values = c(Labeled = '#ffb639', 
+                               Non_labeled = '#006889'
+  )) +
+  theme_bw() +
+  scale_y_continuous(expand = c(0,1)) +
+  labs(y = '# of Features',
+       fill = "Label status",
+       # title = 'Number of features detected per sample',
+       subtitle = 'LC-MS/MS') +
+  facet_grid(cols = vars(time),
+             scales = 'free',
+             space = 'free') +
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_blank(),
+    plot.subtitle = element_text(face = 'italic', hjust = 0.5, size = 8),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(size = 6),
+    axis.title.y = element_text(size = 7),
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 6),
+    strip.text = element_text(size = 6),
+    legend.key.size = unit(0.3, 'lines'),
+    panel.grid = element_blank())
+
+label_plot
+
+label_annot_bar <- label_status %>% 
+  filter(SampleID != 'Palsa_T0') %>% 
+  left_join(metadata, by = 'SampleID') %>% 
+  ggplot() +
+  scale_fill_manual(values = type_col) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  geom_tile(aes(x = SampleID, 
+                y = 1,
+                fill = type),
+            color = 'white') +
+  labs(fill = 'Sample type') +
+  ggnewscale::new_scale_fill() +
+  geom_tile(aes(x = SampleID, 
+                y = 2,
+                fill = time),
+            color = 'white') +
+  labs(fill = 'Time') +
+  scale_fill_manual(values = time_col) +
+  facet_grid(cols = vars(time),
+             scales = 'free',
+             space = 'free') +
+  theme(axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.3, 'lines')) 
+
+label_annot_bar
+
+label_plot_f <- label_plot + nmr_label_status + label_annot_bar + 
+  plot_layout(ncol = 1,
+              heights = c(1, 1, .1),
+              guides = 'collect') &
+  theme(panel.spacing = unit(.2, 'lines'),
+        plot.margin = unit(c(0, 0, 0, 0), 'lines'))
+
+label_plot_f
+
+# ggsave('output_figures/label_status_withNMR.png', label_plot_f, dpi = 300, width = 6, height = 4)
+```
+
+#### New plot type of labeled compounds ----
+
+```{r}
+subclass_of_labeled_df <- label_status %>%
+  inner_join(metadata, by = 'SampleID') %>% 
+  filter(type == 'LO' |
+           type == 'PL',
+         sample_type == 'Labeled',
+         label_irreg == 'Labeled') %>% 
+  select(FeatureID, type) %>% 
+  distinct() %>% 
+  inner_join(lcms_annotation_final, by = 'FeatureID') %>% 
+  group_by(FeatureID, class_lump, classification_ready_lump) %>%
+  summarise(type = paste(type, collapse = ',')) %>%
+  ungroup() %>%
+  mutate(type = ifelse(str_detect(type, ','), 'Shared', type),
+         group = 'Label per sample type')
+
+subclass_of_labeled_times <- label_status %>%
+  inner_join(metadata, by = 'SampleID') %>% 
+  filter(type == 'LO' |
+           type == 'PL',
+         sample_type == 'Labeled',
+         label_irreg == 'Labeled') %>% 
+  select(FeatureID, type, time) %>% 
+  distinct() %>% 
+  inner_join(lcms_annotation_final, by = 'FeatureID') %>% 
+  group_by(FeatureID, class_lump, classification_ready_lump, time) %>%
+  summarise(type = paste(type, collapse = ',')) %>%
+  ungroup() %>%
+  mutate(type = ifelse(str_detect(type, ','), 'Shared', type)) %>% 
+  mutate(class_lump = fct_relevel(
+    class_lump,
+    c(
+      levels(class_lump)[which(str_detect(levels(class_lump),'Other'))],
+      'No annotation'
+    ),
+    after = Inf
+  ),
+  classification_ready_lump = fct_relevel(
+    classification_ready_lump,
+    levels(classification_ready_lump)[which(
+      str_detect(levels(classification_ready_lump), 'Other')
+    )],
+    after = Inf
+  ),
+  classification_ready_lump = factor(classification_ready_lump, 
+                                     levels = rev(levels(classification_ready_lump)))) %>%
+  
+  group_by(type, time, class_lump) %>% 
+  count(classification_ready_lump) %>%
+  mutate(perc_count = n/sum(n) * 100) %>% 
+  ggplot() +
+  geom_point(aes(y = classification_ready_lump,
+                 x = time,
+                 fill = class_lump,
+                 size = n),
+             shape = 21,
+             alpha = .7) +
+  scale_fill_manual(values = get_palette('Paired', 11)) +
+  scale_size(range = c(.5, 2.5)) +
+  labs(size = 'Number of metabolites') +
+  facet_grid2(rows = vars(class_lump), 
+              space = 'free', 
+              scales = 'free_y',
+              switch = 'y') +
+  guides(fill = 'none') +
+  theme_bw() +
+  theme(plot.title = element_text(face = 'bold', hjust = 0.5),
+        strip.text.y.left = element_text(angle = 0, size = 6),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.3, 'lines'),
+        panel.grid = element_blank(),
+        legend.position = 'bottom',
+        strip.placement = 'outer')
+
+subclass_of_labeled_times
+```
+
+# 5. Spectra selection
+
+```{r}
+# labeled_features <- label_status %>% 
+#   filter(label_irreg == 'Labeled',
+#          str_detect(SampleID, 'Palsa'))
+# 
+# mat <- lcms_abundance_table %>% 
+#   select(FeatureID, PNE, contains('E')) %>% 
+#   filter(FeatureID %in% labeled_features$FeatureID) %>% 
+#   column_to_rownames(var = 'FeatureID')
+# 
+# pheatmap::pheatmap(mat,
+#                    scale = 'row')
+```
+
+```{r}
+selected_features <- lcms_abundance_table %>%
+  pivot_longer(!FeatureID, names_to = 'SampleID', values_to = 'AUC') %>% 
+  inner_join(metadata) %>% 
+  group_by(FeatureID, type, time) %>% 
+  filter(type != 'PO') %>% 
+  summarise(mean_auc= mean(AUC)) %>% 
+  filter(FeatureID %in% c('MW_328.22503@RT_37.539',
+                          'MW_780.23422@RT_17.199'))
+
+annot <- selected_features %>% 
+  group_by(FeatureID) %>% 
+  mutate(label = 'Litter,Incubation') %>% 
+  separate_rows(label, sep = ',') %>% 
+  mutate(x_label = ifelse(label == 'Litter', 1, 3.25),
+         y_label = min(mean_auc) + (max(mean_auc) - min(mean_auc))/4,
+         ymax = Inf,
+         ymin = -Inf,
+         xmin = ifelse(label == 'Litter', -Inf, 1.5),
+         xmax = ifelse(label == 'Litter', 1.5, Inf)) %>% 
+  select(FeatureID, label, x_label, y_label, xmin, xmax, ymin, ymax) %>% 
+  distinct()
+
+plot_features <- selected_features %>% 
+  #unite(group, type2, FeatureID, sep = '_', remove = FALSE) %>% 
+  ggplot() +
+  geom_rect(data = annot,
+            aes(xmin = xmin,
+                xmax = xmax,
+                ymin = ymin,
+                ymax = ymax,
+                fill = label),
+            alpha = 0.4,
+            show.legend = FALSE) +
+  geom_line(aes(x = time,
+                y = mean_auc,
+                group = FeatureID),
+            linewidth = .8) +
+  geom_point(aes(x = time,
+                 y = mean_auc),
+             size = 2) +
+  geom_label(data = annot,
+             aes(x = x_label,
+                 y = y_label,
+                 label = label),
+             inherit.aes = FALSE,
+             size = 2) +
+  scale_fill_manual(values = c('Incubation' = 'chocolate4', 'Litter' = 'forestgreen')) +
+  facet_wrap(~FeatureID, scales = 'free', ncol = 1) +
+  labs(x = 'Time point',
+       y = 'AUC') +
+  theme_bw() +
+  theme(axis.title.x = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title.y = element_text(size = 7),
+        strip.text = element_text(size = 5),
+        panel.grid = element_blank())
+
+plot_features
+
+# ggsave('output_figures/sel_features_auc.png', plot_features, dpi = 300, )
+```
+
+# 6. Figure 2
+
+```{r}
+design <- "
+BBCDD
+AEEEE
+"
+shared_fix <- shared_labeled + scale_y_continuous(limits = c(-1, 1.5)) +
+  coord_flip(clip = 'off') +
+  theme(plot.title = element_text(face = 'bold', hjust = 0.5, size = 7))
+
+figure2 <- shared_fix +
+  label_plot_f +
+  plot_features +
+  (ggplot() + theme_void()) +
+  free(subclass_of_labeled_times) +
+  plot_layout(design = design,
+              heights = c(1, 1.5)) +
+  plot_annotation(tag_levels = list(c('C', 'A', '', '', 'B', '', 'D'))) &
+  theme(plot.tag = element_text(face = 'bold', size = 8))
+
+figure2
+
+ggsave('updated_figures/Figure2_up.svg', figure2, dpi = 300, 
+       height = 190, width = 180, units = 'mm')
+```
+
+NOSC class
+
+```{r}
+
+shared_labeled_df_ready <- shared_labeled_df %>% 
+  mutate(label = case_when(
+    PL & LO ~ 'Shared',
+    PL ~ 'Labeled only in the incubation',
+    LO ~ 'Labeled only in litter'
+  ))
+
+nosc_class_plot <- lcms_annotation_final %>% 
+  left_join(shared_labeled_df_ready, by = 'FeatureID') %>% 
+  mutate(label = ifelse(is.na(label), 'Unlabeled', label)) %>% 
+  filter(class_lump != 'Other',
+         class_lump != 'No annotation') %>% 
+  ggplot() +
+  ggbeeswarm::geom_beeswarm(aes(x = label,
+                                y = NOSC,
+                                fill = label),
+                            shape = 21,
+                            alpha = 0.8,
+                            size = 3) +
+  facet_nested(cols = vars(class_lump),
+               space = 'free',
+               scales = 'free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+nosc_class_plot
+```
+
+```{r}
+subclass_of_all <- lcms_annotation_final %>% 
+  select(FeatureID, class_lump, classification_ready_lump)  %>% 
+  mutate(type = 'All',
+         group = 'All',
+         class_lump = if_else(is.na(class_lump), 'No annotation', class_lump),
+         classification_ready_lump = if_else(is.na(classification_ready_lump), 'No annotation',
+                                             classification_ready_lump)) 
+
+axis_scales <- list(
+  scale_x_continuous(limits = c(0, 80)),
+  scale_x_continuous(limits = c(0, 15)),
+  scale_x_continuous(limits = c(0, 15)),
+  scale_x_continuous(limits = c(0, 15))
+)
+
+subclass_of_all_plot <- rbind(subclass_of_labeled_df, subclass_of_all) %>% 
+  mutate(type = case_when(type == 'LO' ~ 'Labeled only in\nLO samples',
+                          type == 'PL' ~ 'Labeled only in\nPL samples',
+                          type == 'Shared' ~ 'Labeled in\nLO and PL',
+                          type == 'All' ~ 'All detected\nmetabolites'),
+         class_lump = fct_relevel(class_lump,
+                                  c(
+                                    levels(class_lump)[which(str_detect(levels(class_lump),'Other'))],
+                                    'No annotation'
+                                  ),
+                                  after = Inf),
+         classification_ready_lump = fct_relevel(classification_ready_lump,
+                                                 levels(classification_ready_lump)[which(
+                                                   str_detect(levels(classification_ready_lump), 'Other')
+                                                 )],
+                                                 after = Inf),
+         classification_ready_lump = factor(classification_ready_lump, 
+                                            levels = rev(levels(classification_ready_lump)))) %>% 
+  group_by(type, group, class_lump) %>% 
+  count(classification_ready_lump) %>%
+  mutate(perc_count = n/sum(n) * 100) %>% 
+  ggplot() +
+  geom_col(aes(y = classification_ready_lump,
+               x = n,
+               fill = class_lump),
+           color = 'black',
+           show.legend = FALSE) +
+  scale_fill_manual(values = get_palette('Paired', 11)) +
+  #scale_y_reverse() +
+  labs(x = 'Number of metabolites',
+       fill = 'Metabolite Class\n(Classyfire)') +
+  facet_grid2(cols = vars(type), 
+              rows = vars(class_lump),
+              scales = 'free', space = 'free', render_empty = FALSE) +
+  facetted_pos_scales(x = axis_scales) +
+  theme_bw() +
+  theme(plot.title = element_text(face = 'bold', hjust = 0.5),
+        strip.text.y = element_text(angle = 0),
+        axis.title.y = element_blank(),
+        text = element_text(size = 10))
+
+subclass_of_all_plot
+```
+
+# 7. Supplementary FIgure 5
+
+```{r}
+supp5 <- label_status %>%
+  inner_join(metadata, by = 'SampleID') %>% 
+  filter(type == 'LO' |
+           type == 'PL',
+         sample_type == 'Labeled',
+         label_irreg == 'Labeled') %>% 
+  select(FeatureID, type, time) %>% 
+  distinct() %>% 
+  inner_join(lcms_annotation_final, by = 'FeatureID') %>% 
+  group_by(FeatureID, class_lump, classification_ready_lump, time) %>%
+  summarise(type = paste(type, collapse = ',')) %>%
+  ungroup() %>%
+  mutate(type = ifelse(str_detect(type, ','), 'Shared', type)) %>% 
+  mutate(class_lump = fct_relevel(
+    class_lump,
+    c(
+      levels(class_lump)[which(str_detect(levels(class_lump),'Other'))],
+      'No annotation'
+    ),
+    after = Inf
+  ),
+  classification_ready_lump = fct_relevel(
+    classification_ready_lump,
+    levels(classification_ready_lump)[which(
+      str_detect(levels(classification_ready_lump), 'Other')
+    )],
+    after = Inf
+  ),
+  classification_ready_lump = factor(classification_ready_lump, 
+                                     levels = rev(levels(classification_ready_lump)))) %>%
+  mutate(n = 1) %>% 
+  group_by(FeatureID) %>% 
+  mutate(to_order = sum(n)) %>% 
+  ungroup() %>% 
+  arrange(to_order) %>% 
+  mutate(order = n():1) %>% 
+  ggplot() +
+  geom_tile(aes(x = time,
+                y = fct_reorder(FeatureID, order),
+                fill = class_lump),
+            color = 'white') +
+  theme_bw() +
+  facet_nested(cols = vars(type),
+               rows = vars(class_lump, classification_ready_lump),
+               scales = 'free',
+               space = 'free',
+               switch = 'y',
+               nest_line = element_line(),
+               solo_line = TRUE,
+               strip = strip_nested(
+                 background_y = elem_list_rect(
+                   fill = 'white',
+                   color = 'transparent'
+                 ),
+                 clip = 'off',
+                 size = 'variable'))  +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_fill_manual(values = c(get_palette('Paired', 10), 'gray')) +
+  guides(fill = 'none') +
+  theme(plot.title = element_text(face = 'bold', hjust = 0.5),
+        strip.text.y.left = element_text(angle = 0, size = 5),
+        strip.text.x = element_text(size = 6),
+        axis.title.y = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.key.size = unit(0.3, 'lines'),
+        panel.grid = element_blank(),
+        legend.position = 'bottom',
+        strip.placement = 'outer',
+        axis.text.y = element_blank()
+  )
+
+supp5
+
+ggsave('updated_figures/Supplementary_Figure5.svg', supp5, dpi = 300, 
+       height = 190, width = 180, units = 'mm')
+
+ggsave('updated_figures/Supplementary_Figure5.png', supp5, dpi = 300, 
+       height = 190, width = 180, units = 'mm')
+```
+
+
+
+
